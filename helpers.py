@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
+import mlflow
+from mlflow.sklearn import log_model
 from pandas import DataFrame
 from collections import defaultdict
-from pandas import DataFrame
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -32,9 +33,9 @@ def generate_wafer_data() -> DataFrame:
 
     return pd.DataFrame(df_dict)
 
-def optimize_memory(data: DataFrame) -> DataFrame:
+def optimize_memory(data: DataFrame, verbose: bool= True) -> DataFrame:
     data = data.copy()
-    print(f'Memory usage before: {data.memory_usage(deep=True).sum() / 1024}KB')
+    before = data.memory_usage(deep=True).sum() / 1024
     registered = defaultdict(list)
     for column in data.columns:
         registered[data[column].dtype].append(column)
@@ -46,7 +47,10 @@ def optimize_memory(data: DataFrame) -> DataFrame:
             elif pd.api.types.is_integer_dtype(key):
                 if len(data[column].unique()) < 127:
                     data[column] = pd.to_numeric(data[column], downcast='integer')
-    print(f'Memory usage after: {data.memory_usage(deep=True).sum() / 1024}KB')
+    after = data.memory_usage(deep=True).sum() / 1024
+    if verbose:
+        print(f'Memory usage before: {before}KB')
+        print(f'Memory usage after: {after}KB')
     return data
 
 def analyze_lots(data: DataFrame, column: str= "defect_count", groupby: str = 'lot_id') -> tuple[DataFrame, DataFrame]:
@@ -61,21 +65,21 @@ def analyze_lots(data: DataFrame, column: str= "defect_count", groupby: str = 'l
     data['lot_avg_defect'] = data.groupby(groupby)[column].transform('mean')
     return agg_data, data
 
-def engineer_features(data: DataFrame):
+def engineer_features(data: DataFrame) -> DataFrame:
     data = data.copy()
     data['defect_above_lot_avg'] = data['defect_count'] > data['lot_avg_defect']
     data['temp_pressure_ratio'] = data['temperature']/data['pressure']
     data['defect_zscore'] = data.groupby('lot_id')['defect_count'].transform(lambda x: (x - x.mean()) / x.std())
     return data
 
-def build_pipeline(data: DataFrame, target: str, features: list[str]) -> tuple[Pipeline, DataFrame, DataFrame, DataFrame, DataFrame, np.ndarray]:
+def build_pipeline(data: DataFrame, target: str, features: list[str], classweight: str | None = None) -> tuple[Pipeline, DataFrame, DataFrame, DataFrame, DataFrame, np.ndarray]:
     data = data.copy()
     y = data[target]
     X = data[features] 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     my_pipe = Pipeline([
         ('scaler', StandardScaler()),
-        ('model', LogisticRegression(class_weight='balanced'))
+        ('model', LogisticRegression(class_weight=classweight))
     ])
     my_pipe.fit(X_train, y_train)
     scores = cross_val_score(my_pipe, X, y, cv=5, scoring='accuracy')
@@ -85,6 +89,16 @@ def evaluate_pipeline(data: DataFrame, target: str, features: list[str]):
     pipeline, X_train, y_train, X_test, y_test, scores = build_pipeline(data = data, target = target, features = features)
     y_pred = pipeline.predict(X = X_test)
     minority_recall = recall_score(y_true= y_test, y_pred= y_pred, pos_label=False)
+    with mlflow.start_run():
+        mlflow.log_param('model', pipeline.get_params()['model'])
+        mlflow.log_param('test_size', X_test.shape[0]/(X_train.shape[0] + X_test.shape[0]))
+        mlflow.log_param('class_weight', pipeline.get_params()['model__class_weight'])
+        mlflow.log_param('feature_list_lenght', X_test.shape[-1])
+        mlflow.log_metric('accuracy', float(accuracy_score(y_true = y_test, y_pred = y_pred)))
+        mlflow.log_metric('CV_mean', scores.mean())
+        mlflow.log_metric('CV_std', scores.std())
+        mlflow.log_metric('Minority_recall', float(minority_recall))
+        log_model(pipeline, "wafer_defect_model")
     print(f'Accuracy: {accuracy_score(y_true = y_test, y_pred = y_pred)}\n')
     print(f'Classification Report: {classification_report(y_true = y_test, y_pred = y_pred)}\n')
     print(f'Confusion Matrix: {confusion_matrix(y_true= y_test, y_pred= y_pred)}')
@@ -93,7 +107,7 @@ def evaluate_pipeline(data: DataFrame, target: str, features: list[str]):
 
     return pipeline
 
-def clean_data(data: DataFrame, config: dict[str, str]):
+def clean_data(data: DataFrame, config: dict[str, str]) -> DataFrame:
     data = data.copy()
     columns = config.keys()
     for i in columns:
