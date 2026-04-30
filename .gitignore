@@ -2,3 +2,8 @@ __pycache__/
 mlartifacts/
 mlruns/
 mlflow.db
+testing.ipynb
+testing.py 
+wafers.db
+wafers.db-journal
+*.csv
